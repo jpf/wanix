@@ -77,7 +77,6 @@ export class FileHandle extends WanixHandle {
   
 export class DirectoryHandle extends WanixHandle {
     dirCache: Map<string, Inode>;
-    lastReadDir: number;
 
     newEntry(name: string, isDir: boolean): Inode {
         if (isDir) {
@@ -89,11 +88,11 @@ export class DirectoryHandle extends WanixHandle {
         }
     }
 
+    // readDir always lists over the wire; callers decide when a
+    // refresh is warranted (see Directory.ensureEntries in fs.ts).
+    // The returned map is retained as dirCache and shared with
+    // Directory.contents, so local create/remove keep both current.
     readDir(): Map<string, Inode> {
-        if (performance.now() - this.lastReadDir < 1000) {
-            return this.dirCache;
-        }
-        this.lastReadDir = performance.now();
         const m = new Map<string, Inode>();
         const entries = this.caller.call("path_readdir", { path: this.path }) || [];
         for (const entry of entries) {
@@ -103,7 +102,15 @@ export class DirectoryHandle extends WanixHandle {
                 isDir = true;
                 name = name.slice(0, -1);
             }
-            m.set(name, this.newEntry(name, isDir));
+            // Keep the existing inode when the entry is still the same
+            // kind, so a re-list preserves inode identity (inos, child
+            // directory caches) instead of rebuilding the subtree.
+            const prev = this.dirCache?.get(name);
+            if (prev !== undefined && (prev instanceof Directory) === isDir) {
+                m.set(name, prev);
+            } else {
+                m.set(name, this.newEntry(name, isDir));
+            }
         }
         this.dirCache = m;
         return m;

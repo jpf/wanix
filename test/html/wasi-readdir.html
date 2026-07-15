@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>wasi-readdir</title>
+    <script>
+        // Capture console output before wanix loads: the fixture's fds
+        // are bound to #web/console, whose writes surface as console.log.
+        window.__captured = "";
+        const origLog = console.log.bind(console);
+        console.log = (...args) => {
+            window.__captured += args.join(" ") + "\n";
+            origLog(...args);
+        };
+    </script>
+    <script type="module" src="../../dist/wanix.min.js"></script>
+</head>
+<body>
+
+    <!--
+      Regression check for the WASI shim's directory listing after the
+      readdir cache moved from time-based (1s TTL) to event-based
+      invalidation: a wasip1 Go program lists "/" through fd_readdir,
+      exercising OpenDirectory drain snapshots, Directory.ensureEntries,
+      and DirectoryHandle.readDir.
+
+      Build test/wasi/golang first, then run: wtest -wait-done <url>
+    -->
+    <wanix-namespace debug>
+        <wanix-bind type="fetch" dst="golangcheck.wasm" src="../wasi/golang/golangcheck.wasm"></wanix-bind>
+        <!-- no term: the task's fds bind to #web/console (console.log) -->
+        <wanix-task id="check" cmd="golangcheck.wasm" start></wanix-task>
+    </wanix-namespace>
+
+    <script type="module">
+        const fail = (msg) => { throw new Error("wasi-readdir: " + msg); };
+
+        async function waitForOutput(pattern, ms) {
+            const deadline = performance.now() + ms;
+            while (performance.now() < deadline) {
+                if (window.__captured.includes(pattern)) return;
+                await new Promise((r) => setTimeout(r, 250));
+            }
+            if (window.__dump) await window.__dump();
+            fail(`timed out waiting for ${JSON.stringify(pattern)} in console output: ` +
+                JSON.stringify(window.__captured));
+        }
+
+        async function main() {
+            const el = document.querySelector("wanix-namespace");
+            if (!el._kernel?.isReady) {
+                await new Promise((r) => el.addEventListener("ready", r, { once: true }));
+            }
+            const root = el._kernel.root;
+            console.log("kernel ready; root:", JSON.stringify(await root.readDir(".")));
+            const task = document.getElementById("check");
+            await task._nsReady;
+            const tpath = `#task/${task.rid}`;
+            console.log("task rid:", task.rid, "ns:", JSON.stringify(await root.readDir(`${tpath}/ns`)));
+            window.__dump = async () => {
+                console.log("task dir:", JSON.stringify(await root.readDir(tpath)));
+                for (const f of ["cmd", "exit", "err"]) {
+                    try {
+                        console.log(`task ${f}:`, JSON.stringify(await root.readText(`${tpath}/${f}`)));
+                    } catch (e) {
+                        console.log(`task ${f}: unreadable (${e})`);
+                    }
+                }
+            };
+
+            // The declarative wanix-task runs the wasip1 fixture, which
+            // prints cwd, args, env, and the entries of "/" with
+            // directories suffixed "/".
+            await waitForOutput("Root:", 30000);
+            const listing = window.__captured.slice(window.__captured.indexOf("Root:"));
+            // The fetch-bound wasm file must appear, typed as a file.
+            if (!listing.includes("golangcheck.wasm")) fail("bound file missing from readdir of /: " + listing);
+            if (listing.includes("golangcheck.wasm/")) fail("file mislabeled as a directory: " + listing);
+
+            window.__wtest_done = true;
+        }
+
+        main().catch((err) => {
+            console.error(String(err));
+            window.__wtest_fail = String(err);
+        });
+    </script>
+
+</body>
+</html>

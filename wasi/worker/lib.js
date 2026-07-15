@@ -3795,6 +3795,10 @@ var OpenFile2 = class extends Fd {
 };
 var OpenDirectory2 = class extends Fd {
   dir;
+  // Entries snapshotted at the start of each readdir drain, so one
+  // guest listing enumerates a stable set (and indexing by cookie is
+  // O(1) instead of rebuilding an array per dirent).
+  snapshot = null;
   constructor(dir) {
     super();
     this.dir = dir;
@@ -3830,10 +3834,14 @@ var OpenDirectory2 = class extends Fd {
         )
       };
     }
-    if (cookie >= BigInt(this.dir.contents.size) + 2n) {
+    if (this.snapshot === null || cookie === 2n) {
+      this.dir.ensureEntries();
+      this.snapshot = Array.from(this.dir.contents.entries());
+    }
+    if (cookie >= BigInt(this.snapshot.length) + 2n) {
       return { ret: 0, dirent: null };
     }
-    const [name, entry] = Array.from(this.dir.contents.entries())[Number(cookie - 2n)];
+    const [name, entry] = this.snapshot[Number(cookie - 2n)];
     return {
       ret: 0,
       dirent: new wasi_defs_exports.Dirent(
@@ -3928,6 +3936,7 @@ var OpenDirectory2 = class extends Fd {
       const target_is_dir = entry.stat().filetype == wasi_defs_exports.FILETYPE_DIRECTORY;
       if (source_is_dir && target_is_dir) {
         if (allow_dir && entry instanceof Directory2) {
+          entry.syncEntries();
           if (entry.contents.size == 0) {
           } else {
             return wasi_defs_exports.ERRNO_NOTEMPTY;
@@ -4094,12 +4103,23 @@ var Directory2 = class _Directory extends Inode {
     super();
     this.handle = handle;
   }
+  // syncEntries lists the directory over the wire. It is called at
+  // the points that define listing freshness — opening the directory
+  // and a failed name lookup (see ensureEntries) — never on a timer.
   syncEntries() {
     this.contents = this.handle.readDir();
     for (const entry of this.contents.values()) {
       if (entry instanceof _Directory) {
         entry.parent = this;
       }
+    }
+  }
+  // ensureEntries serves path lookups from the last listing, going
+  // to the wire only if this directory has never been listed. Misses
+  // trigger one refresh at the call site before reporting ENOENT.
+  ensureEntries() {
+    if (this.contents === void 0) {
+      this.syncEntries();
     }
   }
   removeEntry(name) {
@@ -4143,8 +4163,12 @@ var Directory2 = class _Directory extends Inode {
       if (!(entry instanceof _Directory)) {
         return { ret: wasi_defs_exports.ERRNO_NOTDIR, entry: null };
       }
-      entry.syncEntries();
-      const child = entry.contents.get(component);
+      entry.ensureEntries();
+      let child = entry.contents.get(component);
+      if (child === void 0) {
+        entry.syncEntries();
+        child = entry.contents.get(component);
+      }
       if (child !== void 0) {
         entry = child;
       } else {
@@ -4185,8 +4209,12 @@ var Directory2 = class _Directory extends Inode {
         entry: null
       };
     }
-    parent_entry.syncEntries();
-    const entry = parent_entry.contents.get(filename);
+    parent_entry.ensureEntries();
+    let entry = parent_entry.contents.get(filename);
+    if (entry === void 0) {
+      parent_entry.syncEntries();
+      entry = parent_entry.contents.get(filename);
+    }
     if (entry === void 0) {
       if (!allow_undefined) {
         return {
@@ -4308,7 +4336,6 @@ var FileHandle = class extends WanixHandle {
 };
 var DirectoryHandle = class _DirectoryHandle extends WanixHandle {
   dirCache;
-  lastReadDir;
   newEntry(name, isDir) {
     if (isDir) {
       const handle = new _DirectoryHandle(this.caller, this.subpath(name));
@@ -4318,11 +4345,11 @@ var DirectoryHandle = class _DirectoryHandle extends WanixHandle {
       return new File2(handle);
     }
   }
+  // readDir always lists over the wire; callers decide when a
+  // refresh is warranted (see Directory.ensureEntries in fs.ts).
+  // The returned map is retained as dirCache and shared with
+  // Directory.contents, so local create/remove keep both current.
   readDir() {
-    if (performance.now() - this.lastReadDir < 1e3) {
-      return this.dirCache;
-    }
-    this.lastReadDir = performance.now();
     const m = /* @__PURE__ */ new Map();
     const entries = this.caller.call("path_readdir", { path: this.path }) || [];
     for (const entry of entries) {
@@ -4332,7 +4359,12 @@ var DirectoryHandle = class _DirectoryHandle extends WanixHandle {
         isDir = true;
         name = name.slice(0, -1);
       }
-      m.set(name, this.newEntry(name, isDir));
+      const prev = this.dirCache?.get(name);
+      if (prev !== void 0 && prev instanceof Directory2 === isDir) {
+        m.set(name, prev);
+      } else {
+        m.set(name, this.newEntry(name, isDir));
+      }
     }
     this.dirCache = m;
     return m;

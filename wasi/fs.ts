@@ -175,7 +175,11 @@ export class OpenFile extends Fd {
   
 export class OpenDirectory extends Fd {
     dir: Directory;
-  
+    // Entries snapshotted at the start of each readdir drain, so one
+    // guest listing enumerates a stable set (and indexing by cookie is
+    // O(1) instead of rebuilding an array per dirent).
+    private snapshot: [string, Inode][] | null = null;
+
     constructor(dir: Directory) {
       super();
       this.dir = dir;
@@ -225,13 +229,19 @@ export class OpenDirectory extends Fd {
         };
       }
   
-      if (cookie >= BigInt(this.dir.contents.size) + 2n) {
+      // Cookie 2 is the first real entry, i.e. the start of a drain:
+      // snapshot the listing there and serve the rest of the drain
+      // from it, however many fd_readdir calls the drain spans.
+      if (this.snapshot === null || cookie === 2n) {
+        this.dir.ensureEntries();
+        this.snapshot = Array.from(this.dir.contents.entries());
+      }
+
+      if (cookie >= BigInt(this.snapshot.length) + 2n) {
         return { ret: 0, dirent: null };
       }
-  
-      const [name, entry] = Array.from(this.dir.contents.entries())[
-        Number(cookie - 2n)
-      ];
+
+      const [name, entry] = this.snapshot[Number(cookie - 2n)];
   
       return {
         ret: 0,
@@ -364,6 +374,7 @@ export class OpenDirectory extends Fd {
         const target_is_dir = entry.stat().filetype == wasi.FILETYPE_DIRECTORY;
         if (source_is_dir && target_is_dir) {
           if (allow_dir && entry instanceof Directory) {
+            entry.syncEntries(); // emptiness must be judged on a fresh listing
             if (entry.contents.size == 0) {
               // Allow overwriting empty directories
             } else {
@@ -568,18 +579,30 @@ export class OpenDirectory extends Fd {
     contents: Map<string, Inode>;
     private parent: Directory | null = null;
     private handle: DirectoryHandle;
-  
+
     constructor(handle: DirectoryHandle) {
       super();
       this.handle = handle;
     }
 
+    // syncEntries lists the directory over the wire. It is called at
+    // the points that define listing freshness — opening the directory
+    // and a failed name lookup (see ensureEntries) — never on a timer.
     syncEntries() {
         this.contents = this.handle.readDir();
         for (const entry of this.contents.values()) {
             if (entry instanceof Directory) {
               entry.parent = this;
             }
+        }
+    }
+
+    // ensureEntries serves path lookups from the last listing, going
+    // to the wire only if this directory has never been listed. Misses
+    // trigger one refresh at the call site before reporting ENOENT.
+    ensureEntries() {
+        if (this.contents === undefined) {
+            this.syncEntries();
         }
     }
 
@@ -631,8 +654,14 @@ export class OpenDirectory extends Fd {
             if (!(entry instanceof Directory)) {
                 return { ret: wasi.ERRNO_NOTDIR, entry: null };
             }
-            entry.syncEntries();
-            const child = entry.contents.get(component);
+            entry.ensureEntries();
+            let child = entry.contents.get(component);
+            if (child === undefined) {
+                // The name may have been created since the last
+                // listing: refresh once before reporting ENOENT.
+                entry.syncEntries();
+                child = entry.contents.get(component);
+            }
             if (child !== undefined) {
                 entry = child;
             } else {
@@ -688,8 +717,13 @@ export class OpenDirectory extends Fd {
           entry: null,
         };
       }
-      parent_entry.syncEntries();
-      const entry: Inode | undefined | null = parent_entry.contents.get(filename);
+      parent_entry.ensureEntries();
+      let entry: Inode | undefined | null = parent_entry.contents.get(filename);
+      if (entry === undefined) {
+        // Refresh once: the name may exist but postdate our listing.
+        parent_entry.syncEntries();
+        entry = parent_entry.contents.get(filename);
+      }
       if (entry === undefined) {
         if (!allow_undefined) {
           return {
