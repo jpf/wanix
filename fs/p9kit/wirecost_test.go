@@ -91,34 +91,36 @@ func expectCounts(t *testing.T, phase string, got map[uint8]int, want map[uint8]
 	}
 }
 
-// TestLsWireCostBaseline pins the CURRENT wire cost of the operations
-// the rc shell's `ls` drives through p9kit, so the pending listing
-// fixes land as a measured reduction in these numbers rather than an
-// unverified claim. Every assertion below documents pathological
-// behavior on purpose:
+// TestLsWireCostBaseline pins the wire cost of the operations the rc
+// shell's `ls` drives through p9kit. The previous revision of this
+// test pinned the pathological pre-fix numbers (the "300 stats for
+// one ls" relay trace of 2026-07-15); the `want` maps now hold the
+// fixed costs so a regression toward per-entry round-trips fails
+// loudly. What changed, per phase:
 //
-//   - FS.ReadDir walks+getattrs+clunks EVERY entry individually
-//     (client.go ReadDir), although the .L dirents it already holds
-//     carry each entry's qid and type. For a k-entry directory that is
-//     3k round-trips on top of the listing itself — the dominant term
-//     in the 2026-07-15 "300 stats for one ls" relay trace.
+//   - FS.ReadDir used to walk+getattr+clunk EVERY entry (3k extra
+//     round-trips for k entries) although the .L dirents it already
+//     held carry each entry's qid and type. It now builds lazyEntry
+//     values straight from the dirents: 27 messages for 7 entries
+//     became 4, attributes fetched only if Info() is called.
 //
-//   - OpenContext tries ReadWrite first on everything (client.go
-//     OpenContext); a directory always fails that and is retried
-//     ReadOnly: two Tlopens and a server-side error per directory
-//     open, visible as the deterministic Rerror in every listing
-//     cycle of that trace.
+//   - OpenContext tried ReadWrite first on everything; a directory
+//     always failed that and was retried ReadOnly — two Tlopens and a
+//     deterministic Rerror per directory open. The walk qid now types
+//     the target, and directories open ReadOnly directly.
 //
-//   - remoteFile.ReadDir issues one Tgetattr PER ENTRY on the
-//     DIRECTORY'S OWN fid (client.go remoteFile.ReadDir), so every
-//     entry also comes back wearing the directory's attributes — see
-//     TestRemoteFileReadDirMislabelsEntries.
+//   - remoteFile.ReadDir issued one Tgetattr PER ENTRY on the
+//     DIRECTORY'S OWN fid, so every entry came back wearing the
+//     directory's attributes (a plain file claimed IsDir()==true —
+//     see TestRemoteFileReadDirLabelsEntries). Entries are now typed
+//     by their dirent qid; a lazy Info() walks to the entry itself.
 //
-//   - remoteFile.Close fsyncs unconditionally, one wasted round-trip
-//     per read-only handle.
+//   - remoteFile.Close fsynced unconditionally; it now fsyncs only
+//     handles that were opened writable.
 //
-// When the fixes land, the `want` maps below shrink; update them in
-// the same commit so the diff records the before/after.
+// Composite effect: one ls-shaped pass over 7 entries fell from 51
+// messages to 28 (and the remaining floor is the caller's per-entry
+// Stat, not ReadDir overhead).
 func TestLsWireCostBaseline(t *testing.T) {
 	// Seven entries in the root: five files, two subdirectories.
 	backend := fskit.MapFS{
@@ -141,9 +143,9 @@ func TestLsWireCostBaseline(t *testing.T) {
 			t.Fatalf("entries = %d, want 7", len(entries))
 		}
 		expectCounts(t, "FS.ReadDir", cc.take(), map[uint8]int{
-			msgTwalk:    9, // dir walk + clone + ONE PER ENTRY (pathological)
-			msgTgetattr: 7, // ONE PER ENTRY (pathological)
-			msgTclunk:   9, // per-entry fids + dir + clone
+			msgTwalk:    1, // just the directory itself — entries ride the dirents
+			msgTgetattr: 0,
+			msgTclunk:   1,
 			msgTlopen:   1,
 			msgTreaddir: 1,
 		})
@@ -156,7 +158,7 @@ func TestLsWireCostBaseline(t *testing.T) {
 		}
 		got := cc.take()
 		expectCounts(t, "OpenContext(dir)", got, map[uint8]int{
-			msgTlopen: 2, // ReadWrite attempt fails on a dir, retried ReadOnly (pathological)
+			msgTlopen: 1, // walk qid says dir → straight to ReadOnly
 			msgTwalk:  1,
 		})
 
@@ -171,7 +173,7 @@ func TestLsWireCostBaseline(t *testing.T) {
 		}
 		expectCounts(t, "remoteFile.ReadDir", cc.take(), map[uint8]int{
 			msgTreaddir: 1,
-			msgTgetattr: 1, // ONE PER ENTRY, on the directory's own fid (pathological)
+			msgTgetattr: 0, // entry types come from the dirent qids
 			msgTwalk:    0,
 		})
 
@@ -179,7 +181,7 @@ func TestLsWireCostBaseline(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 		expectCounts(t, "Close", cc.take(), map[uint8]int{
-			msgTfsync: 1, // unconditional fsync on a read-only handle (pathological)
+			msgTfsync: 0, // read-only handles are not fsynced
 			msgTclunk: 1,
 		})
 	})
@@ -207,29 +209,30 @@ func TestLsWireCostBaseline(t *testing.T) {
 		for _, n := range got {
 			total += n
 		}
-		// Seven entries currently cost 51 messages for ONE listing pass:
-		// Stat(dir)=3 + ReadDir=27 (walk+clone+open+list + 3 per entry)
-		// + 7×Stat(entry)=21. Post-fix this should approach ~13
-		// (walk+open+list+clunks + one lazy stat per entry at most).
-		if total != 51 {
-			t.Errorf("composite ls total = %d messages, want 51 (the pinned pathological baseline)", total)
+		// Seven entries cost 28 messages per listing pass, down from the
+		// 51 this test pinned pre-fix: Stat(dir)=3 + ReadDir=4
+		// (walk+open+list+clunk) + 7×Stat(entry)=21. The per-entry
+		// Stats are the caller's own (filepath.Walk lstats everything);
+		// ReadDir itself no longer adds per-entry traffic.
+		if total != 28 {
+			t.Errorf("composite ls total = %d messages, want 28 (was 51 before the listing fixes)", total)
 		}
 		expectCounts(t, "composite", got, map[uint8]int{
-			msgTgetattr: 15, // dir + 7 in ReadDir + 7 in per-entry Stat
-			msgTwalk:    17,
-			msgTclunk:   17,
+			msgTgetattr: 8, // dir + 7 in per-entry Stat; none from ReadDir
+			msgTwalk:    9,
+			msgTclunk:   9,
 		})
 	})
 }
 
-// TestRemoteFileReadDirMislabelsEntries documents (does not endorse) a
-// correctness bug the wire-cost fix must also address: remoteFile.
-// ReadDir stats the DIRECTORY's own fid for every entry, so each entry
-// reports the directory's attributes under its own name — here a plain
-// file claims to be a directory.
-func TestRemoteFileReadDirMislabelsEntries(t *testing.T) {
+// TestRemoteFileReadDirLabelsEntries covers the correctness half of
+// the listing fix: remoteFile.ReadDir used to stat the DIRECTORY's own
+// fid for every entry, so each entry reported the directory's
+// attributes — a plain file claimed IsDir()==true. Entries are now
+// typed by their own dirent qid, and Info() walks to the entry itself.
+func TestRemoteFileReadDirLabelsEntries(t *testing.T) {
 	backend := fskit.MapFS{"sub/inner": fskit.RawNode([]byte("hello"))}
-	fsys, _, cleanup := countingSetup(t, backend)
+	fsys, cc, cleanup := countingSetup(t, backend)
 	defer cleanup()
 
 	f, err := fs.OpenContext(context.Background(), fsys, "sub")
@@ -244,9 +247,26 @@ func TestRemoteFileReadDirMislabelsEntries(t *testing.T) {
 	if len(entries) != 1 || entries[0].Name() != "inner" {
 		t.Fatalf("entries = %v", entries)
 	}
-	// "inner" is a 5-byte regular file; today it wears sub's attrs.
-	if !entries[0].IsDir() {
-		t.Fatalf("baseline shifted: entry no longer mislabeled as a dir — " +
-			"if this is the fix landing, fold this test into the fixed expectations")
+	if entries[0].IsDir() {
+		t.Fatalf("inner is a plain file but IsDir() = true (the pre-fix mislabel)")
 	}
+	if entries[0].Type() != 0 {
+		t.Fatalf("Type() = %v, want 0 (regular file)", entries[0].Type())
+	}
+
+	// Info() is lazy: it walks to the entry itself and stats it there,
+	// on demand, rather than mislabeling it up front.
+	cc.take()
+	fi, err := entries[0].Info()
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if fi.IsDir() || fi.Size() != 5 {
+		t.Fatalf("Info = dir:%v size:%d, want plain 5-byte file", fi.IsDir(), fi.Size())
+	}
+	expectCounts(t, "lazy Info", cc.take(), map[uint8]int{
+		msgTwalk:    1,
+		msgTgetattr: 1,
+		msgTclunk:   1,
+	})
 }
