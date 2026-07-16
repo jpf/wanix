@@ -225,6 +225,68 @@ func TestLsWireCostBaseline(t *testing.T) {
 	})
 }
 
+// TestServerReaddirWireCost pins the wire cost of the path the rc
+// shell actually drives: a p9kit SERVER fronting a namespace whose
+// directory is a p9kit CLIENT mount (the `3ds`-style relay mount).
+// This composition — not FS.ReadDir in isolation — is what a gojs
+// task's `ls` hits, and it was the real "300 stats for one ls"
+// amplifier: server.Readdir used to stat EVERY entry through the mount
+// (walk+getattr+clunk each) to fill in dirent QIDs, on top of the
+// listing itself.
+//
+// The fix builds each dirent QID from the DirEntry alone (type from
+// the .L dirent, path from a string hash), so a k-entry directory
+// costs one client listing and ZERO per-entry round-trips. If someone
+// reintroduces a per-entry stat here, Tgetattr goes back above zero
+// and this fails.
+func TestServerReaddirWireCost(t *testing.T) {
+	backend := fskit.MapFS{
+		"f1": fskit.RawNode([]byte("x")), "f2": fskit.RawNode([]byte("x")),
+		"f3": fskit.RawNode([]byte("x")), "f4": fskit.RawNode([]byte("x")),
+		"f5":        fskit.RawNode([]byte("x")),
+		"sub/inner": fskit.RawNode([]byte("x")),
+		"sub2/deep": fskit.RawNode([]byte("x")),
+	}
+	fsys, cc, cleanup := countingSetup(t, backend)
+	defer cleanup()
+	cc.take() // discard version/attach setup traffic
+
+	// The server p9file that fronts the mounted client fs to a task.
+	srv := &p9file{path: ".", fsys: fsys}
+	dents, err := srv.Readdir(0, 100)
+	if err != nil {
+		t.Fatalf("server Readdir: %v", err)
+	}
+	if len(dents) != 7 {
+		t.Fatalf("dents = %d, want 7", len(dents))
+	}
+
+	// One client listing, no per-entry stats: walk+lopen+readdir+clunk.
+	got := cc.take()
+	if got[msgTgetattr] != 0 {
+		t.Errorf("server Readdir issued %d Tgetattr over the mount — per-entry stat is back (the storm)", got[msgTgetattr])
+	}
+	total := 0
+	for _, n := range got {
+		total += n
+	}
+	if total > 6 {
+		t.Errorf("server Readdir wire cost = %d messages, want <=6 (one listing, no per-entry traffic); got %v", total, got)
+	}
+
+	// Dirents must still be correctly typed from the DirEntry alone.
+	dt := map[string]p9.QIDType{}
+	for _, d := range dents {
+		dt[d.Name] = d.Type
+	}
+	if dt["sub"] != p9.QIDType(4) { // DT_DIR
+		t.Errorf("sub dirent type = %d, want 4 (DT_DIR)", dt["sub"])
+	}
+	if dt["f1"] != p9.QIDType(8) { // DT_REG
+		t.Errorf("f1 dirent type = %d, want 8 (DT_REG)", dt["f1"])
+	}
+}
+
 // TestRemoteFileReadDirLabelsEntries covers the correctness half of
 // the listing fix: remoteFile.ReadDir used to stat the DIRECTORY's own
 // fid for every entry, so each entry reported the directory's
