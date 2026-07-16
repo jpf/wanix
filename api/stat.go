@@ -13,8 +13,6 @@ func (s *syscaller) stat(r rpc.Responder, c *rpc.Call) {
 	var args []string
 	c.Receive(&args)
 
-	log.Println("[apitrace] Stat", args[0])
-
 	fi, err := fs.Stat(s.task.NS(), args[0])
 	if err != nil {
 		r.Return(err)
@@ -38,8 +36,6 @@ func (s *syscaller) stat(r rpc.Responder, c *rpc.Call) {
 func (s *syscaller) lstat(r rpc.Responder, c *rpc.Call) {
 	var args []string
 	c.Receive(&args)
-
-	log.Println("[apitrace] Lstat", args[0])
 
 	fi, err := fs.Lstat(s.task.NS(), args[0])
 	if err != nil {

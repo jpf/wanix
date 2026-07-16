@@ -11,7 +11,7 @@ func (s *syscaller) readDir(r rpc.Responder, c *rpc.Call) {
 	var args []string
 	c.Receive(&args)
 
-	log.Println("[apitrace] ReadDir", args[0])
+	// log.Println("ReadDir", args)
 
 	dir, err := fs.ReadDir(s.task.NS(), args[0])
 	if err != nil {
