@@ -110,3 +110,49 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// TestNSLsRealistic mirrors a real wanix task namespace: a ramfs at
+// ".", sibling roots, and the device mounted at "3ds" — then measures
+// one ls. If this inflates well past the single-mount cost, the
+// remaining multiplier is union/binding overhead, not the mount.
+func TestNSLsRealistic(t *testing.T) {
+	backend := fskit.MapFS{}
+	subs := []string{"audio", "camera", "display", "input", "ir", "led", "nfc", "power", "sd", "system"}
+	for _, s := range subs {
+		for _, f := range []string{"a", "b", "c"} {
+			backend["3ds/"+s+"/"+f] = fskit.RawNode([]byte("x"))
+		}
+	}
+	client, cc, cleanup := countingSetup(t, backend)
+	defer cleanup()
+
+	ns := vfs.New(context.Background())
+	// ramfs-like root union plus sibling roots, like repl-rc.
+	ns.Bind(fskit.MapFS{"placeholder": fskit.RawNode([]byte(""))}, ".", ".", vfs.BindAfter)
+	ns.Bind(fskit.MapFS{"x": fskit.RawNode([]byte(""))}, ".", "task", vfs.BindAfter)
+	ns.Bind(fskit.MapFS{"x": fskit.RawNode([]byte(""))}, ".", "web", vfs.BindAfter)
+	// the device mount
+	ns.Bind(client, "3ds", "3ds", vfs.BindAfter)
+	cc.take()
+
+	total := func(m map[uint8]int) int {
+		n := 0
+		for _, v := range m {
+			n += v
+		}
+		return n
+	}
+	entries, err := fs.ReadDir(ns, "3ds")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	rd := cc.take()
+	for _, e := range entries {
+		if _, err := fs.Lstat(ns, "3ds/"+e.Name()); err != nil {
+			t.Fatalf("Lstat %q: %v", e.Name(), err)
+		}
+	}
+	ls := cc.take()
+	t.Logf("realistic ns: readDir stats=%d (total msgs=%d); 10x lstat stats=%d (total msgs=%d)",
+		rd[msgTgetattr], total(rd), ls[msgTgetattr], total(ls))
+}
